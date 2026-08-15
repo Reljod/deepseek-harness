@@ -125,6 +125,17 @@ function makeHost() {
     },
     reportEntryError: (key, entry, _error, info) => {
       if (!info.abdicate || abdicated.has(entry)) return
+      // Mirror the ledger policy: retiring is a fall-through, so an entry
+      // alone in its cell is kept — the real core never leaves a cell dry.
+      const all = entries.get(key) ?? []
+      const kind = specs.get(key)?.kind
+      const cellOf = (candidate: StoredEntry) =>
+        kind === 'keyed' ? candidate.options.key : kind === 'list' ? candidate.options.id : undefined
+      const cell = cellOf(entry)
+      const hasSuccessor = all.some(
+        candidate => candidate !== entry && !abdicated.has(candidate) && cellOf(candidate) === cell,
+      )
+      if (!hasSuccessor) return
       abdicated.add(entry)
       bump(key)
     },
@@ -1025,5 +1036,34 @@ describe('session-maybe adoption identity', () => {
     act(() => { h.current.set('s1') })
     act(() => { h.current.set('s1') })
     expect(view.container.textContent).toBe('s1#1')
+  })
+
+  // The composer bar is exactly this shape: one registration in a single
+  // session-maybe cell, so it has no successor to fall to and its boundary is
+  // what the user sees. Latching that boundary for the life of the page would
+  // leave a session whose render crashed with no composer at all.
+  it('retries a crashed entry when the session changes instead of latching the crash face', () => {
+    const h = makeHost()
+    h.addSession('s1')
+    h.addSession('s2')
+    h.declare('k.maybe', SINGLE_MAYBE)
+    h.add('k.maybe', {
+      component: ({ sessionId }: { sessionId?: string }) => {
+        if (sessionId === 's1') throw new Error('entry boom')
+        return <b>{sessionId ?? 'blank'}</b>
+      },
+    })
+    const { view } = mountRoot(h, { 'k.maybe': SINGLE_MAYBE }, renderSlot => renderSlot('k.maybe', {}))
+    expect(view.container.textContent).toBe('blank')
+
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    act(() => { h.current.set('s1') })
+    spy.mockRestore()
+    expect(view.container.querySelector('[data-slot-error]')).not.toBeNull()
+
+    // The inputs that crashed it are gone, so the entry gets another render.
+    act(() => { h.current.set('s2') })
+    expect(view.container.querySelector('[data-slot-error]')).toBeNull()
+    expect(view.container.textContent).toBe('s2')
   })
 })

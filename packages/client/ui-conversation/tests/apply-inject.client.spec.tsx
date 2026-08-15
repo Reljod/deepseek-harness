@@ -194,12 +194,10 @@ describe('conversation slot inject API', () => {
     await b.runtime.dispose()
   })
 
-  it('inject fails loud when the session resolves no binding or the scope lacks the service', async () => {
+  it('inject renders a session with no binding as its no-session state', async () => {
     const b = await bench()
     const entry = b.entryOf('conversation.composer.bar')
     const injectFn = entry.inject as unknown as (sessionId: SessionId | undefined) => ComposerBarInjected
-    // Unknown session: the keyboard face's binding resolution answers nothing.
-    expect(() => { injectFn('ghost' as SessionId).stop!() }).toThrow(/resolved no binding/)
     // No session (session-maybe absent side): machine faces absent, static
     // hooks compartment still present so the render side's hook order holds.
     const absent = injectFn(undefined)
@@ -209,8 +207,25 @@ describe('conversation slot inject API', () => {
     expect(absent.hooks.notices.getSnapshot()).toBeNull()
     expect(absent.hooks.lexicon.getSnapshot().size).toBe(0)
     expect(absent.hooks.menuLauncher.getSnapshot()).toBeNull()
+
+    // An id whose binding is already gone takes the same branch rather than
+    // throwing. This inject runs inside the entry's error boundary, and the
+    // bar is the only registration its single slot has: a throw here retires
+    // it and leaves the user no way to type until the page is reloaded.
+    const ghost = injectFn('ghost' as SessionId)
+    expect(ghost.keyboard).toBeUndefined()
+    expect(ghost.stop).toBeUndefined()
+    expect(ghost.hooks.lexicon.getSnapshot().size).toBe(0)
+    await b.runtime.dispose()
+  })
+
+  it('inject fails loud when a live session scope lost the conversation service', async () => {
+    const b = await bench()
+    const entry = b.entryOf('conversation.composer.bar')
+    const injectFn = entry.inject as unknown as (sessionId: SessionId | undefined) => ComposerBarInjected
     // A scope whose service tree lost 'conversation' (the feature fiber
-    // unloaded while a retained inject closure re-runs): fails loud too.
+    // unloaded while a retained inject closure re-runs) is a miswired tree,
+    // not a torn-down session, and still fails loud.
     const stop = injectFn(ROOT).stop!
     await b.feature.dispose()
     expect(() => { stop() }).toThrow(/unavailable through the session scope/)

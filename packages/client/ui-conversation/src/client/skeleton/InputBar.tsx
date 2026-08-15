@@ -48,13 +48,14 @@ export function InputBar({
   resolveSubmitMode, toggleCommandMenu, stop, command, t,
   renderSlot, useNotices, useLexicon, useMenuLauncher,
   useProjection, sessionId, variant, disabled: inert = false, blocked,
-  workspacePickerOpen = false, onRequestWorkspace,
+  workspacePickerOpen = false, onRequestWorkspace, useFocusClaim,
   placeholder, accessory, overlay, leftItems, rightItems, footer,
 }: InputBarProps) {
   const input = useInput(s => s)
   const notice = useNotices(s => s)
   const lexicon = useLexicon(s => s)
   const commandMenuOpen = useMenuLauncher(source => source === 'command')
+  const focusClaim = useFocusClaim(claim => claim)
   const promptError = useSession(s => s.promptError) ?? null
   const running = useSession(s => s.running) ?? false
   const subagent = useSession(s => s.subagent) ?? null
@@ -219,6 +220,41 @@ export function InputBar({
     revealSelectionFocus(el)
   }, [locked, sessionId])
 
+  // The plugin's focus claim, answered separately from the unlock effect
+  // above: a claim can arrive while neither `locked` nor `sessionId` changes
+  // (picking the workspace a blank session already sits in keeps both fixed),
+  // and unlike that effect this one owns the caret rather than revealing where
+  // it already is.
+  const servedClaim = useRef<number | undefined>(undefined)
+  const resumePending = useRef(false)
+  useEffect(() => {
+    const el = inputRef.current
+    // The claim names its session because the bar remounts on the switch it
+    // follows: a mount-time baseline would make the new incarnation treat an
+    // already-raised claim as old and never answer it.
+    if (focusClaim.sessionId === sessionId && focusClaim.seq !== servedClaim.current) {
+      servedClaim.current = focusClaim.seq
+      resumePending.current = true
+    }
+    if (!resumePending.current || locked || el === null) return
+    el.focus({ preventScroll: true })
+    // Resume at the end of the draft. A claim follows a handoff that rewrote
+    // the draft under a textarea nobody was editing, and the caret is left at
+    // 0 there — continuing to type would insert BEFORE the carried-over text
+    // instead of after it. The claim stays open across the renders the handoff
+    // takes (the outgoing draft, the incoming session's empty one, then the
+    // carried value, each of which re-collapses the caret) and closes on the
+    // first keystroke, which is the point the user owns the caret again.
+    el.setSelectionRange(el.value.length, el.value.length)
+    revealSelectionFocus(el)
+    // The carried draft has landed, so the caret is where the user will type.
+    if (draft !== '') resumePending.current = false
+    // `sessionId` is a dependency because the switch itself is what collapses
+    // the caret: the textarea is reused across sessions, and the incoming
+    // session can carry the same draft string as the outgoing one, so a
+    // draft-only dependency would never re-run for the render that needs it.
+  }, [focusClaim, locked, draft, sessionId])
+
   // A persisted draft arrives AFTER the unlock effect: ConversationSession
   // adopts it in its own mount effect, and a parent's mount effect runs after
   // its children's. Reveal when the draft becomes non-empty so a restored long
@@ -342,6 +378,9 @@ export function InputBar({
   const onChange = (e: ChangeEvent<HTMLTextAreaElement>): void => {
     if (keyboard === undefined || locked) return // disabled/read-only states cannot edit the draft
     if (machineBusy) return // submitting is the read-only span; adjudicating holds the pending lock
+    // The user is editing again, so the owner's resume claim is satisfied and
+    // must stop moving the caret to the end behind them.
+    resumePending.current = false
     const next = e.target.value
     keyboard.setDraft(next)
     // selectionStart is number|null in lib.dom; the type-aware lint program narrows it.

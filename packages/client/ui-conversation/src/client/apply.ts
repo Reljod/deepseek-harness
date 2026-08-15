@@ -13,8 +13,8 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type { ViewTab } from './contract/views.ts'
 import type {
   ApprovalWait, ChatNodeTurnDataInjected, ChatScrollPosition, ChatViewInjected, ComposerBarInjected,
-  ComposerChainProps, ConversationInjected, ConversationSessionHeaderInjected, ConversationSessionInjected,
-  DetailsInjected,
+  ComposerChainProps, ComposerFocusClaim, ConversationInjected, ConversationSessionHeaderInjected,
+  ConversationSessionInjected, DetailsInjected,
 } from './contract/slots.ts'
 import type { InputNotice } from './input/contract.ts'
 import { createChatStore } from './stores.ts'
@@ -73,6 +73,37 @@ const ABSENT_LEXICON = {
 const ABSENT_MENU_LAUNCHER = {
   getSnapshot: (): string | null => null,
   subscribe: () => () => {},
+}
+
+/** No claim outstanding; the composer bar's resting focus state. */
+const NO_FOCUS_CLAIM: ComposerFocusClaim = { seq: 0, sessionId: undefined }
+
+/**
+ * The composer's focus claim. It lives on the plugin fiber rather than in a
+ * component because the flow that raises it — a workspace pick — switches the
+ * session, and both the resident skeleton and the bar remount on that switch:
+ * component state would reset before the bar ever served the claim. It names
+ * the session it is for, so the bar that answers is the one the draft moved
+ * to and not the outgoing one still on screen.
+ */
+class FocusClaim {
+  private claim: ComposerFocusClaim = NO_FOCUS_CLAIM
+  private readonly listeners = new Set<() => void>()
+  readonly getSnapshot = (): ComposerFocusClaim => this.claim
+  readonly subscribe = (fn: () => void): (() => void) => {
+    this.listeners.add(fn)
+    return () => { this.listeners.delete(fn) }
+  }
+
+  /**
+   * Ask the named session's composer to take focus back and resume at the end
+   * of its draft.
+   * @param sessionId - the session whose bar should answer.
+   */
+  raise(sessionId: SessionId): void {
+    this.claim = { seq: this.claim.seq + 1, sessionId }
+    for (const fn of [...this.listeners]) fn()
+  }
 }
 
 const CHAT_NODE_INJECT: ChatNodeTurnDataInjected = {
@@ -175,6 +206,10 @@ export function apply(ctx: Context): void {
   // way: this package must not import the plugins that would know.
   const composerBlocks = new ComposerBlockRegistry()
 
+  // Raised when a flow completes inside the composer but leaves the caret
+  // nowhere (the workspace pick unmounts the list under the pointer).
+  const composerFocus = new FocusClaim()
+
   // The input machine feeds every session-scope slot
   // component through the standard provide channel — the 'input' hook plus
   // the two public actions. Materialization is the shell creation trigger
@@ -213,11 +248,14 @@ export function apply(ctx: Context): void {
       hooks: { composerBlock: sessionId === undefined ? ABSENT_BLOCK : composerBlocks.storeFor(sessionId) },
       selectWorkspace: async (workspaceId) => {
         const nextId = await workspaces.connectWorkspace(workspaceId)
-        if (sessionId !== undefined && nextId !== sessionId) {
-          const from = inputHub.shell(sessionId)
-          const draft = from.snapshot.draft
-          const imageIds = from.snapshot.imageIds
-          const next = inputHub.shell(nextId)
+        const from = sessionId === undefined ? undefined : inputHub.maybeShell(sessionId)
+        const next = nextId === sessionId ? undefined : inputHub.maybeShell(nextId)
+        if (from !== undefined && next !== undefined) {
+          // The snapshot is read after the connect settles so it carries
+          // whatever the user typed while it was in flight; anything typed
+          // between here and the switch below still lands in the outgoing
+          // shell and is lost with it.
+          const { draft, imageIds } = from.snapshot
           if (imageIds.length === 0 || next.addImages(imageIds)) {
             if (draft !== '') {
               next.setDraft(draft)
@@ -229,6 +267,11 @@ export function apply(ctx: Context): void {
           }
         }
         sessions.open(nextId)
+        // The picker list unmounts under the pointer, dropping focus to the
+        // document; without this claim the keystrokes that follow the pick
+        // reach no editable node and the draft looks frozen at whatever was
+        // typed before it.
+        composerFocus.raise(nextId)
       },
     }),
   }, ConversationRoot)
@@ -286,7 +329,12 @@ export function apply(ctx: Context): void {
       'conversation.input.model': { kind: 'single', scope: 'session' },
     },
     inject: (sessionId: SessionId | undefined): ComposerBarInjected => {
-      if (sessionId === undefined) {
+      // An id whose binding is already gone is the no-session state as far as
+      // this bar is concerned: the machine faces it would carry do not exist.
+      // Both absences take the same branch because the alternative — throwing
+      // — retires this registration, and it is the only one the slot has.
+      const shell = sessionId === undefined ? undefined : inputHub.maybeShell(sessionId)
+      if (sessionId === undefined || shell === undefined) {
         return {
           keyboard: undefined,
           addImages: undefined,
@@ -297,11 +345,15 @@ export function apply(ctx: Context): void {
           toggleCommandMenu: undefined,
           stop: undefined,
           command: undefined,
-          hooks: { notices: ABSENT_NOTICES, lexicon: ABSENT_LEXICON, menuLauncher: ABSENT_MENU_LAUNCHER },
+          hooks: {
+            notices: ABSENT_NOTICES,
+            lexicon: ABSENT_LEXICON,
+            menuLauncher: ABSENT_MENU_LAUNCHER,
+            focusClaim: composerFocus,
+          },
         }
       }
       const conversation = concreteConversation(ctx)
-      const shell = inputHub.shell(sessionId)
       const inputTriggers = inputHub.inputTriggers(sessionId)
       return {
         keyboard: shell,
@@ -355,6 +407,7 @@ export function apply(ctx: Context): void {
           notices: shell.notices,
           lexicon: shell.lexicon,
           menuLauncher: inputTriggers?.launcher ?? ABSENT_MENU_LAUNCHER,
+          focusClaim: composerFocus,
         },
       }
     },

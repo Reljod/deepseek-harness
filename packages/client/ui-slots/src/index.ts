@@ -1082,27 +1082,56 @@ export class SlotCore {
   /**
    * Renderer crash report from an entry boundary. Always notifies
    * {@link SlotCore.onEntryError} listeners; with `info.abdicate` set (the
-   * shadowing kinds — single/keyed/list) it first retires the entry from its
-   * cell, one-shot: the record's version bumps through the ordinary mutation
-   * channel so outlets re-project onto the cell's next survivor, and a
-   * repeat abdicating report no-ops entirely. Chain crashes report with
-   * `abdicate: false` — election alternatives resolve at select time, so the
-   * entry keeps its cell and only the notification fires. The registration
-   * itself stays on the ledger either way — raw {@link SlotCore.entries}
-   * still lists the entry and its disposer keeps working.
+   * shadowing kinds — single/keyed/list) it retires the entry from its cell
+   * provided the cell holds another live entry to fall to, one-shot: the
+   * record's version bumps through the ordinary mutation channel so outlets
+   * re-project onto that survivor, and a repeat abdicating report no-ops.
+   * The last live entry of a cell is never retired — retirement is permanent
+   * (the ledger has no expiry) and a dry single-kind cell can then never
+   * render again, so a crash there stays a boundary-local crash face that a
+   * remount clears. Chain crashes report with `abdicate: false` — election
+   * alternatives resolve at select time, so the entry keeps its cell and only
+   * the notification fires. The registration itself stays on the ledger in
+   * every case — raw {@link SlotCore.entries} still lists the entry and its
+   * disposer keeps working.
    * @param key - slot key the entry rendered under.
    * @param entry - the crashed entry.
    * @param error - the crash cause, forwarded to listeners verbatim.
-   * @param info - `abdicate`: whether the crash retires the entry from its cell.
+   * @param info - `abdicate`: whether the crash may retire the entry from its cell.
    */
   reportEntryError(key: string, entry: StoredEntry, error: unknown, info: { abdicate: boolean }): void {
-    if (info.abdicate) {
-      if (this.abdicated.has(entry)) return
+    // Retiring is a fall-through, so it needs somewhere to fall: an entry that
+    // occupies its cell alone is kept even when it crashes. Retiring it would
+    // trade a crash face that a remount can clear for one that nothing can —
+    // the abdication ledger has no expiry — and for a single-kind cell like
+    // the composer bar that permanently removes the surface from the app.
+    const abdicated = info.abdicate && !this.abdicated.has(entry) && this.hasCellSuccessor(key, entry)
+    if (abdicated) {
       this.abdicated.add(entry)
       const rec = this.records.get(key)
       if (rec !== undefined) this.markDirty(key, rec)
     }
-    for (const fn of [...this.entryErrorListeners]) fn(key, entry, error, { abdicated: info.abdicate })
+    for (const fn of [...this.entryErrorListeners]) fn(key, entry, error, { abdicated })
+  }
+
+  /**
+   * Whether another live entry shares `entry`'s cell and could render in its
+   * place. Chain keys never shadow, so an elected entry has no successor by
+   * construction.
+   * @param key - slot key the entry is registered under.
+   * @param entry - the entry whose cell is being examined.
+   * @returns true when the cell holds at least one other non-abdicated entry.
+   */
+  private hasCellSuccessor(key: string, entry: StoredEntry): boolean {
+    const rec = this.records.get(key)
+    if (!rec?.spec || rec.spec.kind === 'chain') return false
+    const kind = rec.spec.kind
+    const cellOf = (candidate: StoredEntry): string | undefined =>
+      kind === 'keyed' ? candidate.options.key : kind === 'list' ? candidate.options.id : undefined
+    const cell = cellOf(entry)
+    return rec.entries.some(
+      candidate => candidate !== entry && !this.abdicated.has(candidate) && cellOf(candidate) === cell,
+    )
   }
 
   /**

@@ -134,6 +134,14 @@ function bench(over?: BenchOptions) {
   const stop = vi.fn()
   const removeImage = vi.fn((id: DraftAttachmentId) => { shell.removeImage(id) })
   const menuLauncher = createSnapshotStore<string | null>(over?.commandMenuOpen === true ? 'command' : null)
+  // The plugin's focus claim; raising one for this session asks the bar to
+  // retake focus and resume at the end of its draft.
+  const focusClaim = createSnapshotStore<{ seq: number; sessionId: SessionId | undefined }>({
+    seq: 0, sessionId: undefined,
+  })
+  const raiseFocusClaim = () => {
+    focusClaim.set({ seq: focusClaim.getSnapshot().seq + 1, sessionId: SID })
+  }
   const slotCalls: { key: string; owner: unknown }[] = []
   const renderSlot = ((key: string, owner: object) => {
     slotCalls.push({ key, owner })
@@ -175,6 +183,7 @@ function bench(over?: BenchOptions) {
     useNotices: bindSnapshotSelector(shell.notices),
     useLexicon: bindSnapshotSelector(shell.lexicon),
     useMenuLauncher: bindSnapshotSelector(menuLauncher),
+    useFocusClaim: bindSnapshotSelector(focusClaim),
     stop,
     command: over?.command ?? (() => Promise.resolve(true)),
     // Mirrors the real lookup chain (conversation namespace, then common).
@@ -199,7 +208,7 @@ function bench(over?: BenchOptions) {
   const interruptButton = view.container.querySelector<HTMLButtonElement>('button[aria-label="停止生成"]')
   return {
     view, textarea, button, interruptButton, props, sink, shell, wiring: shell, session, stop, removeImage, slotCalls,
-    menuLauncher,
+    menuLauncher, focusClaim, raiseFocusClaim,
     steerQueue: over?.steerQueue,
   }
 }
@@ -748,6 +757,85 @@ describe('running and lock semantics', () => {
     textarea.blur()
     fireEvent.mouseDown(first.view.container.querySelector('button[aria-label="发送消息"]')!)
     expect(document.activeElement).toBe(textarea)
+  })
+
+  // The workspace pick settles without changing session or lock state, so the
+  // owner's focus claim is the only thing that brings the caret back from the
+  // unmounted picker list; without it the next keystrokes reach the document.
+  it('a raised focus claim returns focus and resumes at the end of the draft', () => {
+    const { textarea, raiseFocusClaim } = bench({ draft: 'C' })
+    textarea.blur()
+    textarea.setSelectionRange(0, 0)
+    expect(document.activeElement).not.toBe(textarea)
+
+    act(() => { raiseFocusClaim() })
+
+    expect(document.activeElement).toBe(textarea)
+    // Resumes after the carried-over draft, so typing appends rather than
+    // inserting in front of it.
+    expect(textarea.selectionStart).toBe(1)
+    expect(textarea.selectionEnd).toBe(1)
+  })
+
+  it('ignores a claim raised for another session', () => {
+    const { textarea, focusClaim } = bench({ draft: 'C' })
+    textarea.blur()
+
+    act(() => { focusClaim.set({ seq: 1, sessionId: 'other' as SessionId }) })
+
+    expect(document.activeElement).not.toBe(textarea)
+  })
+
+  // The bar remounts on the switch the claim follows, so a fresh incarnation
+  // must still answer a claim that was raised before it existed.
+  it('answers a claim raised before this incarnation mounted', () => {
+    const { view, props, focusClaim } = bench({ draft: 'carried' })
+    act(() => { focusClaim.set({ seq: 1, sessionId: SID }) })
+    cleanup()
+
+    const remounted = render(<InputBar {...props} />)
+    const textarea = remounted.container.querySelector('textarea')!
+    expect(document.activeElement).toBe(textarea)
+    expect(textarea.selectionStart).toBe(7)
+    void view
+  })
+
+  // The handoff renders the incoming session's empty draft before the carried
+  // value lands, and each of those renders re-collapses the caret; the claim
+  // has to survive them and close only once the user types.
+  it('holds the claim across the renders the handoff takes, then releases on typing', () => {
+    const { textarea, wiring, raiseFocusClaim } = bench()
+    textarea.blur()
+    act(() => { raiseFocusClaim() })
+
+    // The carried draft arrives a render later: the caret follows it there.
+    act(() => { wiring.setDraft('carried') })
+    expect(textarea.selectionStart).toBe(7)
+
+    // The user takes over, which closes the claim: a later draft change no
+    // longer pulls focus back into the box.
+    fireEvent.change(textarea, { target: { value: 'carried!' } })
+    textarea.blur()
+    act(() => { wiring.setDraft('carried!x') })
+    expect(document.activeElement).not.toBe(textarea)
+  })
+
+  it('leaves focus alone while no claim is outstanding', () => {
+    const { textarea, focusClaim } = bench({ draft: 'C' })
+    textarea.blur()
+
+    act(() => { focusClaim.set({ seq: 0, sessionId: undefined }) })
+
+    expect(document.activeElement).not.toBe(textarea)
+  })
+
+  it('does not steal focus into a locked composer', () => {
+    const { textarea, raiseFocusClaim } = bench({ disabled: true })
+    textarea.blur()
+
+    act(() => { raiseFocusClaim() })
+
+    expect(document.activeElement).not.toBe(textarea)
   })
 
   it('typing forwards through the machine (draft state echoes back)', () => {

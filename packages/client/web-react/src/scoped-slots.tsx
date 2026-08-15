@@ -309,18 +309,34 @@ function entryKeyOf(entry: StoredEntry): number {
  * factory) must not take down siblings. Assembly errors (missing providers)
  * rethrow — a miswired shell must fail loud, not degrade into fallbacks.
  * Every catch reports through `onEntryError` (the ledger's supervision
- * seam); for shadowing kinds the report abdicates the entry, the outlet
- * re-renders onto the cell's next survivor, and this boundary's crash face
- * only shows until that re-render lands (permanently once the cell is dry —
- * the outlet then owns the crash face).
+ * seam); for shadowing kinds the report abdicates the entry when its cell has
+ * a survivor to fall to, and this boundary's crash face only shows until that
+ * re-render lands. A cell with no survivor keeps its entry, so the crash face
+ * here is what the user sees, and `retryToken` is what clears it: the owner
+ * raises it when the inputs that crashed the entry have been replaced (a
+ * session switch), giving the entry another render instead of leaving the
+ * cell dead for the lifetime of the page.
  */
 class SlotErrorBoundary extends Component<
-  { slotKey: string; onEntryError: (error: unknown) => void; children: ReactNode }, { failed: boolean }
+  {
+    slotKey: string
+    onEntryError: (error: unknown) => void
+    children: ReactNode
+    retryToken?: string | undefined
+  },
+  { failed: boolean; retriedAt: string | undefined }
 > {
-  override state = { failed: false }
+  override state = { failed: false, retriedAt: this.props.retryToken }
   static getDerivedStateFromError(error: unknown): { failed: boolean } {
     if (error instanceof SlotAssemblyError) throw error
     return { failed: true }
+  }
+  static getDerivedStateFromProps(
+    props: { retryToken?: string | undefined },
+    state: { failed: boolean; retriedAt: string | undefined },
+  ): { failed: boolean; retriedAt: string | undefined } | null {
+    if (props.retryToken === state.retriedAt) return null
+    return { failed: false, retriedAt: props.retryToken }
   }
   override componentDidCatch(error: unknown): void {
     console.error(`slot entry crashed in '${this.props.slotKey}':`, error)
@@ -728,7 +744,18 @@ function renderOutletContent(
         />
       )
       : (
-        <SlotErrorBoundary slotKey={slotKey} key={key} onEntryError={onEntryError}>
+        <SlotErrorBoundary
+          slotKey={slotKey}
+          key={key}
+          onEntryError={onEntryError}
+          // Session-maybe entries deliberately survive session changes without
+          // remounting (the composer keeps its textarea across the transition),
+          // so a crash would otherwise outlive every input that caused it. The
+          // current session id is the coarse "these inputs are new" signal that
+          // earns the entry another render; root entries have no such input and
+          // stay latched until they remount.
+          retryToken={spec.scope === 'session-maybe' ? sessionInfo.sessionId ?? '' : undefined}
+        >
           {spec.scope === 'session-maybe'
             ? (
               <SessionMaybeEntry

@@ -384,3 +384,85 @@ describe('subscription API', () => {
     expect(keys).toHaveLength(1)
   })
 })
+
+describe('entry crash supervision', () => {
+  /** The two registrations a cell-contention fixture put on one key. */
+  const pair = (core: SlotCore, key: string) => {
+    const [head, next] = core.entries(key)
+    if (head === undefined || next === undefined) throw new Error(`two registrations expected under ${key}`)
+    return { head, next }
+  }
+
+  it('retires a crashed entry that has a survivor to fall to', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.single', registrant: 'first', priority: 0 }, Comp)
+    core.register({ name: 'test.single', registrant: 'second', priority: 1 }, Comp)
+    const { head, next } = pair(core, 'test.single')
+    expect(core.entriesOfSlot('test.single')).toEqual([head])
+
+    const seen: { abdicated: boolean }[] = []
+    core.onEntryError((_key, _entry, _error, info) => seen.push(info))
+    core.reportEntryError('test.single', head, new Error('boom'), { abdicate: true })
+
+    expect(seen).toEqual([{ abdicated: true }])
+    expect(core.entriesOfSlot('test.single')).toEqual([next])
+  })
+
+  it('keeps a crashed entry that occupies its cell alone', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.single' }, Comp)
+    const [entry] = core.entries('test.single')
+    if (entry === undefined) throw new Error('registration expected')
+
+    const seen: { abdicated: boolean }[] = []
+    core.onEntryError((_key, _entry, _error, info) => seen.push(info))
+    core.reportEntryError('test.single', entry, new Error('boom'), { abdicate: true })
+
+    // Reported as a crash, never retired: retirement is permanent, so a dry
+    // single cell that gave up its last entry could not render again at all.
+    expect(seen).toEqual([{ abdicated: false }])
+    expect(core.entriesOfSlot('test.single')).toEqual([entry])
+  })
+
+  it('keeps the last survivor of a cell whose other entry already retired', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.single', registrant: 'first', priority: 0 }, Comp)
+    core.register({ name: 'test.single', registrant: 'second', priority: 1 }, Comp)
+    const { head, next } = pair(core, 'test.single')
+
+    core.reportEntryError('test.single', head, new Error('boom'), { abdicate: true })
+    core.reportEntryError('test.single', next, new Error('boom'), { abdicate: true })
+
+    expect(core.entriesOfSlot('test.single')).toEqual([next])
+  })
+
+  it('judges list cells per id rather than across the key', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.list', id: 'a' }, Comp)
+    core.register({ name: 'test.list', id: 'b' }, Comp)
+    const { head } = pair(core, 'test.list')
+
+    // The `b` entry holds a different cell, so it is no successor for `a`.
+    core.reportEntryError('test.list', head, new Error('boom'), { abdicate: true })
+    expect(core.entriesOfSlot('test.list')).toHaveLength(2)
+  })
+
+  it('reports chain crashes without retiring the elected entry', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.chain', select: () => null }, Comp)
+    const [entry] = core.entries('test.chain')
+    if (entry === undefined) throw new Error('registration expected')
+
+    const seen: { abdicated: boolean }[] = []
+    core.onEntryError((_key, _entry, _error, info) => seen.push(info))
+    core.reportEntryError('test.chain', entry, new Error('boom'), { abdicate: false })
+
+    expect(seen).toEqual([{ abdicated: false }])
+    expect(core.entriesOfSlot('test.chain')).toEqual([entry])
+  })
+})

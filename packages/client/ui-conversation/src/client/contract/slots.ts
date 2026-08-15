@@ -489,6 +489,17 @@ export interface ComposerBarOwnerProps {
   footer?: ReactNode
 }
 
+/**
+ * A request for the composer to take focus back and resume at the end of its
+ * draft, raised by the plugin and served by the bar of the named session.
+ */
+export interface ComposerFocusClaim {
+  /** Monotonic claim id; `0` is the resting value no bar answers. */
+  readonly seq: number
+  /** The session whose bar should answer, or undefined while none is claimed. */
+  readonly sessionId: SessionId | undefined
+}
+
 /** Injected share of the composer-bar entry (package-internal faces). */
 export interface ComposerBarInjected {
   /** The InputBar-exclusive keyboard/DOM command face (private plane); absent with the session. */
@@ -529,6 +540,13 @@ export interface ComposerBarInjected {
     lexicon: ObservableSnapshot<ReadonlyMap<'/' | '@', readonly string[]>>
     /** Source name opened by the programmatic menu launcher, or null. */
     menuLauncher: ObservableSnapshot<string | null>
+    /**
+     * Outstanding focus claim. The plugin raises one for flows that complete
+     * inside the composer but destroy the focused element on the way (the
+     * workspace pick), which would otherwise leave the keyboard addressing the
+     * document and silently drop what the user types next.
+     */
+    focusClaim: ObservableSnapshot<ComposerFocusClaim>
   }
 }
 

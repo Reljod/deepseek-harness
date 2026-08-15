@@ -111,11 +111,27 @@ export class InputHub implements SessionInputResolver {
    * @returns the shell.
    */
   shell(id: SessionId): SessionInputShell {
+    const shell = this.maybeShell(id)
+    if (shell === undefined) throw new Error(`conversation.input: session "${id}" resolved no binding`)
+    return shell
+  }
+
+  /**
+   * Resident shell by session id for callers that render an id they do not
+   * own the lifetime of. A session-maybe slot receives the current id from
+   * one observable and its binding from another, so a teardown that lands
+   * between those two reads presents an id with no binding; the composer bar
+   * renders that as its own no-session state rather than throwing, because a
+   * render-time throw there retires the only composer registration and leaves
+   * the user with no way to type at all.
+   * @param id - session id.
+   * @returns the shell, or undefined once the session holds no binding.
+   */
+  maybeShell(id: SessionId): SessionInputShell | undefined {
     const existing = this.shells.get(id)
     if (existing !== undefined) return existing
     const binding = this.sessions().binding(id)
-    if (binding === undefined) throw new Error(`conversation.input: session "${id}" resolved no binding`)
-    return this.shellFor(binding)
+    return binding === undefined ? undefined : this.shellFor(binding)
   }
 
   /**
